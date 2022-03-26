@@ -15,8 +15,8 @@ use iced::{
 };
 
 use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
-use std::{env, fmt};
 pub use views::about::{About as AboutView, Message as AboutMessage};
 pub use views::list::{
     List as AppsView, LoadingState as ListLoadingState, Message as AppsMessage, State as ListState,
@@ -46,7 +46,6 @@ impl Default for View {
     }
 }
 
-#[derive(Debug)]
 struct PureState {
     state: State,
 }
