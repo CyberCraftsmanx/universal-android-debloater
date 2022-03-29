@@ -46,24 +46,11 @@ impl Default for View {
     }
 }
 
-struct PureState {
-    state: State,
-}
-
-// WORKAROUND: pure::State does not impl Default
-impl Default for PureState {
-    fn default() -> Self {
-        PureState {
-            state: State::new(),
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct UadGui {
     ready: bool,
     view: View,
-    state: PureState,
+    state: State,
     apps_view: AppsView,
     about_view: AboutView,
     settings_view: SettingsView,
@@ -425,7 +412,7 @@ impl Application for UadGui {
         };
 
         Pure::new(
-            &mut self.state.state,
+            &mut self.state,
             column()
                 .width(Length::Fill)
                 .push(navigation_container)
