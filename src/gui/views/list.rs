@@ -1,20 +1,20 @@
-use crate::core::sync::{action_handler, adb_shell_command, Phone, User};
+use crate::core::sync::{action_handler, Phone, User};
 use crate::core::uad_lists::{
-    load_debloat_lists, Opposite, Package, PackageState, Removal, UadList,
+    load_debloat_lists, Opposite, Package, PackageState, Removal, UadList, UadListState,
 };
 use crate::core::utils::{
-    export_selection, fetch_packages, import_selection, update_selection_count,
+    export_selection, fetch_packages, import_selection, perform_commands, update_selection_count,
 };
 use crate::gui::style;
 use std::collections::HashMap;
 use std::env;
 
-use crate::gui::views::settings::{Phone as SettingsPhone, Settings};
+use crate::gui::views::settings::Settings;
 use crate::gui::widgets::package_row::{Message as RowMessage, PackageRow};
-use iced::{
-    button, pick_list, scrollable, text_input, Alignment, Button, Column, Command, Container,
-    Element, Length, PickList, Row, Scrollable, Space, Text, TextInput,
+use iced::pure::{
+    button, column, container, pick_list, row, scrollable, text, text_input, Element,
 };
+use iced::{Alignment, Command, Length, Space};
 
 #[derive(Debug, Default, Clone)]
 pub struct Selection {
@@ -32,6 +32,7 @@ pub enum Action {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadingState {
+    FindingPhones,
     DownloadingList,
     LoadingPackages,
     _UpdatingUad,
@@ -56,19 +57,6 @@ pub struct List {
     phone_packages: Vec<Vec<PackageRow>>, // packages of all users of the phone
     filtered_packages: Vec<usize>, // phone_packages indexes of the selected user (= what you see on screen)
     pub selection: Selection,
-    select_all_btn_state: button::State,
-    unselect_all_btn_state: button::State,
-    search_input: text_input::State,
-    user_picklist: pick_list::State<User>,
-    export_selection_btn_state: button::State,
-    no_internet_btn: button::State,
-    apply_remove_selection: button::State,
-    apply_restore_selection: button::State,
-    package_scrollable_state: scrollable::State,
-    description_scrollable_state: scrollable::State,
-    package_state_picklist: pick_list::State<PackageState>,
-    list_picklist: pick_list::State<UadList>,
-    removal_picklist: pick_list::State<Removal>,
     selected_package_state: Option<PackageState>,
     selected_removal: Option<Removal>,
     selected_list: Option<UadList>,
@@ -82,7 +70,7 @@ pub enum Message {
     SearchInputChanged(String),
     ToggleAllSelected(bool),
     InitUadList(bool),
-    ListsIsInitialized(HashMap<String, Package>),
+    ListsIsInitialized((Result<HashMap<String, Package>, ()>, bool)),
     LoadPackages,
     ListSelected(UadList),
     UserSelected(User),
@@ -100,7 +88,7 @@ pub enum Message {
 impl List {
     pub fn update(
         &mut self,
-        settings: &SettingsPhone,
+        settings: &mut Settings,
         phone: &mut Phone,
         message: Message,
     ) -> Command<Message> {
@@ -108,18 +96,30 @@ impl List {
         match message {
             Message::Nothing => Command::none(),
             Message::InitUadList(remote) => {
-                self.state = State::Loading(LoadingState::LoadingPackages);
+                self.state = State::Loading(LoadingState::FindingPhones);
                 if remote {
                     Command::perform(load_debloat_lists(true), Message::ListsIsInitialized)
                 } else {
                     Command::perform(load_debloat_lists(false), Message::ListsIsInitialized)
                 }
             }
-            Message::ListsIsInitialized(uad_lists) => {
-                self.uad_lists = uad_lists;
-                env::set_var("ANDROID_SERIAL", phone.adb_id.clone());
-                Command::perform(Self::do_load_packages(), |_| Message::LoadPackages)
-            }
+            Message::ListsIsInitialized((uad_lists, remote)) => match uad_lists {
+                Ok(list) => {
+                    if !remote {
+                        settings.list_update_state = UadListState::Failed;
+                    } else {
+                        settings.list_update_state = UadListState::Done;
+                    }
+                    self.uad_lists = list;
+                    if !phone.adb_id.is_empty() {
+                        env::set_var("ANDROID_SERIAL", phone.adb_id.clone());
+                        Command::perform(Self::do_load_packages(), |_| Message::LoadPackages)
+                    } else {
+                        Command::none()
+                    }
+                }
+                Err(_) => Command::none(),
+            },
             Message::LoadPackages => {
                 self.state = State::Loading(LoadingState::LoadingPackages);
                 self.selected_package_state = Some(PackageState::Enabled);
@@ -198,7 +198,7 @@ impl List {
 
                 match row_message {
                     RowMessage::ToggleSelection(toggle) => {
-                        if package.removal == Removal::Unsafe && !settings.expert_mode {
+                        if package.removal == Removal::Unsafe && !settings.phone.expert_mode {
                             package.selected = false;
                         } else {
                             package.selected = toggle;
@@ -220,19 +220,31 @@ impl List {
                     }
                     RowMessage::ActionPressed => {
                         let mut commands = vec![];
-                        let actions =
-                            action_handler(&self.selected_user.unwrap(), package, phone, settings);
+                        let actions = action_handler(
+                            &self.selected_user.unwrap(),
+                            package,
+                            phone,
+                            &settings.phone,
+                        );
 
                         for (i, action) in actions.into_iter().enumerate() {
                             // Only the first command can change the package state
                             if i != 0 {
                                 commands.push(Command::perform(
-                                    Self::perform_commands(action, i_package, package.removal),
+                                    perform_commands(
+                                        action,
+                                        i_package,
+                                        package.removal.to_string(),
+                                    ),
                                     |_| Message::Nothing,
                                 ));
                             } else {
                                 commands.push(Command::perform(
-                                    Self::perform_commands(action, i_package, package.removal),
+                                    perform_commands(
+                                        action,
+                                        i_package,
+                                        package.removal.to_string(),
+                                    ),
                                     Message::ChangePackageState,
                                 ));
                             }
@@ -266,25 +278,25 @@ impl List {
                         &self.selected_user.unwrap(),
                         &self.phone_packages[*i_user][i],
                         phone,
-                        settings,
+                        &settings.phone,
                     );
                     for (j, action) in actions.into_iter().enumerate() {
                         // Only the first command can change the package state
                         if j != 0 {
                             commands.push(Command::perform(
-                                Self::perform_commands(
+                                perform_commands(
                                     action,
                                     i,
-                                    self.phone_packages[*i_user][i].removal,
+                                    self.phone_packages[*i_user][i].removal.to_string(),
                                 ),
                                 |_| Message::Nothing,
                             ));
                         } else {
                             commands.push(Command::perform(
-                                Self::perform_commands(
+                                perform_commands(
                                     action,
                                     i,
-                                    self.phone_packages[*i_user][i].removal,
+                                    self.phone_packages[*i_user][i].removal.to_string(),
                                 ),
                                 Message::ChangePackageState,
                             ));
@@ -321,14 +333,14 @@ impl List {
                     let package = &mut self.phone_packages[*i_user][i];
                     update_selection_count(&mut self.selection, package.state, false);
 
-                    if !settings.multi_user_mode {
-                        package.state = package.state.opposite(settings.disable_mode);
+                    if !settings.phone.multi_user_mode {
+                        package.state = package.state.opposite(settings.phone.disable_mode);
                         package.selected = false;
                     } else {
                         for u in &phone.user_list {
                             self.phone_packages[u.index][i].state = self.phone_packages[u.index][i]
                                 .state
-                                .opposite(settings.disable_mode);
+                                .opposite(settings.phone.disable_mode);
                             self.phone_packages[u.index][i].selected = false;
                         }
                     }
@@ -346,19 +358,22 @@ impl List {
         match self.state {
             State::Loading(LoadingState::DownloadingList) => {
                 let text = "Downloading latest UAD lists from Github. Please wait...";
-                waiting_view(settings, text, Some(&mut self.no_internet_btn))
+                waiting_view(settings, text, true)
+            }
+            State::Loading(LoadingState::FindingPhones) => {
+                let text = "Finding connected devices...";
+                waiting_view(settings, text, false)
             }
             State::Loading(LoadingState::LoadingPackages) => {
                 let text = "Pulling packages from the phone. Please wait...";
-                waiting_view(settings, text, None)
+                waiting_view(settings, text, false)
             }
             State::Loading(LoadingState::_UpdatingUad) => {
                 let text = "Updating UAD. Please wait...";
-                waiting_view(settings, text, None)
+                waiting_view(settings, text, false)
             }
             State::Ready => {
-                let search_packages = TextInput::new(
-                    &mut self.search_input,
+                let search_packages = text_input(
                     "Search packages...",
                     &self.input_value,
                     Message::SearchInputChanged,
@@ -366,10 +381,9 @@ impl List {
                 .padding(5)
                 .style(style::SearchInput(settings.theme.palette));
 
-                // let package_amount = Text::new(format!("{} packages found", packages.len()));
+                // let package_amount = text(format!("{} packages found", packages.len()));
 
-                let user_picklist = PickList::new(
-                    &mut self.user_picklist,
+                let user_picklist = pick_list(
                     phone.user_list.clone(),
                     self.selected_user,
                     Message::UserSelected,
@@ -379,31 +393,25 @@ impl List {
 
                 let divider = Space::new(Length::Fill, Length::Shrink);
 
-                let list_picklist = PickList::new(
-                    &mut self.list_picklist,
-                    &UadList::ALL[..],
-                    self.selected_list,
-                    Message::ListSelected,
-                )
-                .style(style::PickList(settings.theme.palette));
+                let list_picklist =
+                    pick_list(&UadList::ALL[..], self.selected_list, Message::ListSelected)
+                        .style(style::PickList(settings.theme.palette));
 
-                let package_state_picklist = PickList::new(
-                    &mut self.package_state_picklist,
+                let package_state_picklist = pick_list(
                     &PackageState::ALL[..],
                     self.selected_package_state,
                     Message::PackageStateSelected,
                 )
                 .style(style::PickList(settings.theme.palette));
 
-                let removal_picklist = PickList::new(
-                    &mut self.removal_picklist,
+                let removal_picklist = pick_list(
                     &Removal::ALL[..],
                     self.selected_removal,
                     Message::RemovalSelected,
                 )
                 .style(style::PickList(settings.theme.palette));
 
-                let control_panel = Row::new()
+                let control_panel = row()
                     .width(Length::Fill)
                     .align_items(Alignment::Center)
                     .spacing(10)
@@ -419,7 +427,7 @@ impl List {
                     .iter_mut()
                     .enumerate()
                     .filter(|(i, _)| self.filtered_packages.contains(i))
-                    .fold(Column::new().spacing(6), |col, (i, p)| {
+                    .fold(column().spacing(6), |col, (i, p)| {
                         col.push(
                             p.view(settings, phone)
                                 .map(move |msg| Message::List(i, msg)),
@@ -430,26 +438,23 @@ impl List {
                 // Seems better to me but I can't fix the lifetime issues
                 let packages = self.filtered_packages
                     .into_iter()
-                    .fold(Column::new().spacing(6), |col, i| {
+                    .fold(column().spacing(6), |col, i| {
                         col.push(self.phone_packages[self.selected_user.unwrap().index][i].view().map(move |msg| Message::List(i, msg)))
                     });
                 */
 
-                let packages_scrollable = Scrollable::new(&mut self.package_scrollable_state)
-                    .push(packages)
-                    .spacing(2)
-                    .align_items(Alignment::Start)
+                let packages_scrollable = scrollable(packages)
+                    .scrollbar_margin(2)
                     .height(Length::FillPortion(6))
                     .style(style::Scrollable(settings.theme.palette));
 
                 // let mut packages_v: Vec<&str> = self.packages.lines().collect();
 
-                let description_scroll = Scrollable::new(&mut self.description_scrollable_state)
-                    .push(Text::new(&self.description))
-                    .padding(7)
+                let description_scroll = scrollable(text(&self.description))
+                    .scrollbar_margin(7)
                     .style(style::DescriptionScrollable(settings.theme.palette));
 
-                let description_panel = Container::new(description_scroll)
+                let description_panel = container(description_scroll)
                     .height(Length::FillPortion(2))
                     .width(Length::Fill)
                     .style(style::Description(settings.theme.palette));
@@ -465,53 +470,42 @@ impl List {
                     "Uninstall"
                 };
 
-                let apply_restore_selection = Button::new(
-                    &mut self.apply_restore_selection,
-                    Text::new(format!(
-                        "{} selection ({})",
-                        restore_action,
-                        self.selection.uninstalled + self.selection.disabled
-                    )),
-                )
+                let apply_restore_selection = button(text(format!(
+                    "{} selection ({})",
+                    restore_action,
+                    self.selection.uninstalled + self.selection.disabled
+                )))
                 .on_press(Message::ApplyActionOnSelection(Action::Restore))
                 .padding(5)
                 .style(style::PrimaryButton(settings.theme.palette));
 
-                let apply_remove_selection = Button::new(
-                    &mut self.apply_remove_selection,
-                    Text::new(format!(
-                        "{} selection ({})",
-                        remove_action, self.selection.enabled
-                    )),
-                )
+                let apply_remove_selection = button(text(format!(
+                    "{} selection ({})",
+                    remove_action, self.selection.enabled
+                )))
                 .on_press(Message::ApplyActionOnSelection(Action::Remove))
                 .padding(5)
                 .style(style::PrimaryButton(settings.theme.palette));
 
-                let select_all_btn =
-                    Button::new(&mut self.select_all_btn_state, Text::new("Select all"))
-                        .padding(5)
-                        .on_press(Message::ToggleAllSelected(true))
-                        .style(style::PrimaryButton(settings.theme.palette));
+                let select_all_btn = button("Select all")
+                    .padding(5)
+                    .on_press(Message::ToggleAllSelected(true))
+                    .style(style::PrimaryButton(settings.theme.palette));
 
-                let unselect_all_btn =
-                    Button::new(&mut self.unselect_all_btn_state, Text::new("Unselect all"))
-                        .padding(5)
-                        .on_press(Message::ToggleAllSelected(false))
-                        .style(style::PrimaryButton(settings.theme.palette));
+                let unselect_all_btn = button("Unselect all")
+                    .padding(5)
+                    .on_press(Message::ToggleAllSelected(false))
+                    .style(style::PrimaryButton(settings.theme.palette));
 
-                let export_selection_btn = Button::new(
-                    &mut self.export_selection_btn_state,
-                    Text::new(format!(
-                        "Export current selection ({})",
-                        self.selection.selected_packages.len()
-                    )),
-                )
+                let export_selection_btn = button(text(format!(
+                    "Export current selection ({})",
+                    self.selection.selected_packages.len()
+                )))
                 .padding(5)
                 .on_press(Message::ExportSelectionPressed)
                 .style(style::PrimaryButton(settings.theme.palette));
 
-                let action_row = Row::new()
+                let action_row = row()
                     .width(Length::Fill)
                     .spacing(10)
                     .align_items(Alignment::Center)
@@ -522,7 +516,7 @@ impl List {
                     .push(apply_restore_selection)
                     .push(apply_remove_selection);
 
-                let content = Column::new()
+                let content = column()
                     .width(Length::Fill)
                     .spacing(10)
                     .align_items(Alignment::Center)
@@ -531,7 +525,7 @@ impl List {
                     .push(description_panel)
                     .push(action_row);
 
-                Container::new(content)
+                container(content)
                     .height(Length::Fill)
                     .padding(10)
                     .style(style::Content(settings.theme.palette))
@@ -558,35 +552,6 @@ impl List {
             .collect();
     }
 
-    async fn perform_commands(
-        action: String,
-        i: usize,
-        recommendation: Removal,
-    ) -> Result<usize, ()> {
-        match adb_shell_command(true, &action) {
-            Ok(o) => {
-                // On old devices, adb commands can return the '0' exit code even if there
-                // is an error. On Android 4.4, ADB doesn't check if the package exists.
-                // It does not return any error if you try to `pm block` a non-existent package.
-                // Some commands are even killed by ADB before finishing and UAD can't catch
-                // the output.
-                if ["Error", "Failure"].iter().any(|&e| o.contains(e)) {
-                    error!("[{}] {} -> {}", recommendation, action, o);
-                    Err(())
-                } else {
-                    info!("[{}] {} -> {}", recommendation, action, o);
-                    Ok(i)
-                }
-            }
-            Err(err) => {
-                if !err.contains("[not installed for") {
-                    error!("[{}] {} -> {}", recommendation, action, err);
-                }
-                Err(())
-            }
-        }
-    }
-
     async fn do_load_packages() -> Message {
         Message::LoadPackages
     }
@@ -608,30 +573,26 @@ impl List {
     }
 }
 
-fn waiting_view<'a>(
-    settings: &Settings,
-    text: &str,
-    btn: Option<&'a mut button::State>,
-) -> Element<'a, Message> {
-    let col = if let Some(btn) = btn {
-        let no_internet_btn = Button::new(btn, Text::new("No internet?"))
+fn waiting_view<'a>(settings: &Settings, displayed_text: &str, btn: bool) -> Element<'a, Message> {
+    let col = if btn {
+        let no_internet_btn = button("No internet?")
             .padding(5)
             .on_press(Message::InitUadList(false))
             .style(style::PrimaryButton(settings.theme.palette));
 
-        Column::new()
+        column()
             .spacing(10)
             .align_items(Alignment::Center)
-            .push(Text::new(text).size(20))
+            .push(text(displayed_text).size(20))
             .push(no_internet_btn)
     } else {
-        Column::new()
+        column()
             .spacing(10)
             .align_items(Alignment::Center)
-            .push(Text::new(text).size(20))
+            .push(text(displayed_text).size(20))
     };
 
-    Container::new(col)
+    container(col)
         .width(Length::Fill)
         .height(Length::Fill)
         .center_y()
